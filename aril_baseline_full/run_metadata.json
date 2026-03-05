@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-03-01T00:42:10.720279",
+  "hostname": "DESKTOP-JF2A0R6",
+  "platform": "Windows-10-10.0.19045-SP0",
+  "python": "3.11.4 | packaged by Anaconda, Inc. | (main, Jul  5 2023, 13:38:37) [MSC v.1916 64 bit (AMD64)]",
+  "torch": "2.5.1+cpu",
+  "cuda_available": false,
+  "cuda_version": null,
+  "git_commit": "0255fc9298d634952b77b49d6d08432e08b74967",
+  "repo_root": "C:\\Users\\howie\\Desktop\\aug\\repro_sensors_25_01547\\prunedAttentionGRU"
+}

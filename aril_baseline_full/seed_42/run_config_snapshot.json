@@ -1,0 +1,50 @@
+{
+  "config": null,
+  "dataset": "aril",
+  "batchsize": 128,
+  "learningrate": 0.001,
+  "epochs": 100,
+  "hidden_size": 128,
+  "attention_dim": 32,
+  "model_variant": "baseline",
+  "freq_feature_dim": 64,
+  "fusion_hidden_dim": 64,
+  "freq_use_abs": false,
+  "freq_eps": 1e-08,
+  "output_dir": "results/protocol",
+  "run_name": "aril_baseline_full",
+  "device": "auto",
+  "num_workers": 0,
+  "log_every": 10,
+  "seed_list": [
+    42,
+    52,
+    62
+  ],
+  "mixup_probs": [
+    0.0,
+    1.0
+  ],
+  "augment_train": false,
+  "split_mode": "predefined",
+  "group_key": "auto",
+  "train_ratio": 0.7,
+  "val_ratio": 0.1,
+  "test_ratio": 0.2,
+  "stratified_random_split": true,
+  "reuse_splits": true,
+  "metadata_path": null,
+  "run_robustness": false,
+  "corruptions": [
+    "gaussian_noise",
+    "frame_dropout",
+    "subcarrier_dropout",
+    "temporal_shift"
+  ],
+  "severity_levels": [],
+  "hash_check_mode": "quick",
+  "save_confusion_png": true,
+  "latency_warmup": 10,
+  "latency_iters": 30,
+  "seed": 42
+}

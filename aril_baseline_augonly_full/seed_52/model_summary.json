@@ -1,0 +1,7 @@
+{
+  "model_variant": "baseline",
+  "fusion_type": "none",
+  "frequency_use_abs": null,
+  "raw_frequency_signature_dim": null,
+  "projected_frequency_feature_dim": null
+}

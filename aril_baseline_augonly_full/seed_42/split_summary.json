@@ -1,0 +1,38 @@
+{
+  "split_file": "C:\\Users\\howie\\Desktop\\aug\\repro_sensors_25_01547\\prunedAttentionGRU\\results\\protocol\\aril_baseline_augonly_full\\splits\\aril_predefined_auto_seed42.json",
+  "loaded_existing_split": false,
+  "split_summary": {
+    "counts": {
+      "train": 976,
+      "val": 140,
+      "test": 278,
+      "total": 1394
+    },
+    "label_counts": {
+      "train": {
+        "0": 166,
+        "1": 165,
+        "2": 165,
+        "3": 167,
+        "4": 154,
+        "5": 159
+      },
+      "val": {
+        "0": 24,
+        "1": 24,
+        "2": 23,
+        "3": 24,
+        "4": 22,
+        "5": 23
+      },
+      "test": {
+        "0": 47,
+        "1": 47,
+        "2": 47,
+        "3": 48,
+        "4": 43,
+        "5": 46
+      }
+    }
+  }
+}

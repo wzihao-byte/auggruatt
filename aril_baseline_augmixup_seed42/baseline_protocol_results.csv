@@ -1,0 +1,7 @@
+metric,mean,std
+accuracy,0.9568345323741008,0.0
+macro_f1,0.9565851488034331,0.0
+loss,0.17918234270253627,0.0
+train_time_sec,8423.059123800136,0.0
+latency_ms_per_batch,146.36058999846378,0.0
+throughput_samples_per_sec,874.5523641394415,0.0

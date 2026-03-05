@@ -1,0 +1,14 @@
+{
+  "dataset": "aril",
+  "num_samples": 1394,
+  "num_classes": 6,
+  "input_size": 52,
+  "class_names": [
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5"
+  ]
+}
