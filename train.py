@@ -33,30 +33,51 @@ def set_train_model(
     optimizer = torch.optim.Adam(model.parameters(),lr = learningrate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     return model,criterion,optimizer,scheduler
-def train_model(device, model, criterion, optimizer, scheduler, num_epochs, trainloader, testloader, p=[0.7, 0.3]):
+
+
+def train_model(
+    device,
+    model,
+    criterion,
+    optimizer,
+    scheduler,
+    num_epochs,
+    trainloader,
+    valloader=None,
+    testloader=None,
+    p=[0.7, 0.3],
+):
     since = time.time()
 
-    best_model_wts = copy.deepcopy(model.state_dict())
+    has_val = valloader is not None
+    phases = ["train"] + (["val"] if has_val else [])
+
+    # Model selection is allowed only on validation metrics.
+    best_model_wts = copy.deepcopy(model.state_dict()) if has_val else None
     best_acc = 0.0
-    # History of acc and loss
-    loss_hist = {"train": [], "test": []}
-    acc_hist = {"train": [], "test": []}
+
+    # Keep history keys aligned with actual phases.
+    loss_hist = {"train": []}
+    acc_hist = {"train": []}
+    if has_val:
+        loss_hist["val"] = []
+        acc_hist["val"] = []
 
     for epoch in range(num_epochs):
         print(f'Epoch {epoch}/{num_epochs - 1}')
         print('-' * 10)
 
-        # Each epoch has a training and validation phase
-        for phase in ['train', 'test']:
+        # Each epoch has train + optional validation phase.
+        for phase in phases:
             if phase == 'train':
                 model.train()  # Set model to training mode
                 dataloader = trainloader
             else:
                 model.eval()   # Set model to evaluate mode
-                dataloader = testloader
+                dataloader = valloader
 
             running_loss = 0.0
-            running_corrects = 0
+            running_corrects = 0.0
 
             # Iterate over data
             for inputs, labels in dataloader:
@@ -65,14 +86,13 @@ def train_model(device, model, criterion, optimizer, scheduler, num_epochs, trai
 
                 optimizer.zero_grad()
 
-                # Option selection
-                option = np.random.choice(['mixup', 'naive'], p=p)
-
-                if option == "mixup":
+                # MixUp must be train-only to keep validation/test clean.
+                use_mixup = phase == "train" and np.random.choice(['mixup', 'naive'], p=p) == "mixup"
+                if use_mixup:
                     inputs, label1, label2, lam = mixup(inputs, labels, 1.0)
                     inputs = inputs.to(device)
                     label1, label2 = label1.to(device), label2.to(device)
-                    lam = float(lam)
+                    lam = float(lam.item()) if hasattr(lam, "item") else float(lam)
                 else:
                     inputs = inputs.to(device)
                     labels = labels.to(device)
@@ -82,7 +102,7 @@ def train_model(device, model, criterion, optimizer, scheduler, num_epochs, trai
                     prediction = model(inputs)
                     _, preds = torch.max(prediction, 1)
                     # print(prediction.shape, preds.shape, labels.shape)
-                    if option == "naive":
+                    if not use_mixup:
                         loss = criterion(prediction, labels)
                         _, onehotlabels = torch.max(labels, 1)
                         acc = float(torch.sum(preds == onehotlabels)) / len(preds)
@@ -97,10 +117,10 @@ def train_model(device, model, criterion, optimizer, scheduler, num_epochs, trai
                         loss.backward()
                         optimizer.step()
 
-                running_loss += loss.item() * inputs.size(0)
-                running_corrects += acc * inputs.size(0)
+                running_loss += float(loss.item()) * inputs.size(0)
+                running_corrects += float(acc) * inputs.size(0)
 
-            if phase == 'train':
+            if phase == 'train' and scheduler is not None:
                 scheduler.step()
 
             epoch_loss = running_loss / len(dataloader.dataset)
@@ -112,16 +132,43 @@ def train_model(device, model, criterion, optimizer, scheduler, num_epochs, trai
             print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.2f}')
 
             # Deep copy the model
-            if phase == 'test' and epoch_acc > best_acc:
+            if phase == 'val' and epoch_acc > best_acc:
                 best_acc = epoch_acc
                 best_model_wts = copy.deepcopy(model.state_dict())
 
     time_elapsed = time.time() - since
     print(f'Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
-    print(f'Best val Acc: {best_acc:4f}')
+    if has_val:
+        print(f'Best val Acc: {best_acc:4f}')
+        # Load best model weights selected on validation only.
+        model.load_state_dict(best_model_wts)
+    else:
+        # Fallback for legacy train-only runs: keep final epoch weights.
+        print('No validation loader provided; keeping final epoch weights.')
 
-    # Load best model weights
-    model.load_state_dict(best_model_wts)
+    # Optional clean test evaluation after model selection (never used for checkpointing).
+    if testloader is not None:
+        model.eval()
+        test_running_loss = 0.0
+        test_running_corrects = 0.0
+        with torch.no_grad():
+            for inputs, labels in testloader:
+                labels = labels.type(torch.FloatTensor).to(device)
+                inputs = inputs.type(torch.FloatTensor).to(device)
+                prediction = model(inputs)
+                _, preds = torch.max(prediction, 1)
+                loss = criterion(prediction, labels)
+                _, onehotlabels = torch.max(labels, 1)
+                acc = float(torch.sum(preds == onehotlabels)) / len(preds)
+                test_running_loss += float(loss.item()) * inputs.size(0)
+                test_running_corrects += float(acc) * inputs.size(0)
+
+        test_loss = test_running_loss / len(testloader.dataset)
+        test_acc = 100 * test_running_corrects / len(testloader.dataset)
+        loss_hist["test_final"] = [test_loss]
+        acc_hist["test_final"] = [test_acc]
+        print(f'test Loss: {test_loss:.4f} Acc: {test_acc:.2f}')
+
     return model, loss_hist, acc_hist
 
 def cross_validate(device, model_class, criterion, optimizer_class, scheduler_class, dataset, num_epochs=50, n_splits=5, batch_size=32, p=[0.7,0.3]):
@@ -148,10 +195,21 @@ def cross_validate(device, model_class, criterion, optimizer_class, scheduler_cl
         optimizer = optimizer_class(model.parameters())
         scheduler = scheduler_class(optimizer)
 
-        model, loss_hist, acc_hist = train_model(device, model, criterion, optimizer, scheduler, num_epochs, trainloader, testloader, p=p)
+        model, loss_hist, acc_hist = train_model(
+            device,
+            model,
+            criterion,
+            optimizer,
+            scheduler,
+            num_epochs,
+            trainloader,
+            valloader=testloader,
+            testloader=None,
+            p=p,
+        )
 
-        # Best accuracy for this fold is the max test accuracy recorded.
-        best_acc = max(acc_hist['test'])
+        # Best accuracy for this fold is the max validation accuracy recorded.
+        best_acc = max(acc_hist['val'])
         fold_accuracies.append(best_acc)
         print(f"Fold {fold+1} Best Accuracy: {best_acc:.2f}")
 
