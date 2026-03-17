@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from sklearn.model_selection import GroupShuffleSplit, StratifiedShuffleSplit
-from torch.utils.data import DataLoader, Sampler, Subset
+from torch.utils.data import DataLoader, Subset
 
 from ARIL.aril import aril
 from HAR.har import har1, har3
@@ -548,28 +548,6 @@ def _build_tensor_dataset(x: np.ndarray, y: np.ndarray) -> TensorData:
     return TensorData(torch.FloatTensor(x), torch.FloatTensor(y))
 
 
-class EpochSubsetRandomSampler(Sampler[int]):
-    def __init__(self, num_items: int, num_samples: int, seed: int) -> None:
-        if int(num_items) <= 0:
-            raise ValueError("num_items must be > 0")
-        if int(num_samples) <= 0:
-            raise ValueError("num_samples must be > 0")
-        if int(num_samples) > int(num_items):
-            raise ValueError("num_samples cannot exceed num_items when sampling without replacement")
-
-        self.num_items = int(num_items)
-        self.num_samples = int(num_samples)
-        self.generator = torch.Generator()
-        self.generator.manual_seed(int(seed))
-
-    def __iter__(self):
-        perm = torch.randperm(self.num_items, generator=self.generator)
-        return iter(perm[: self.num_samples].tolist())
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-
 def build_dataloaders(
     bundle: DatasetBundle,
     split: SplitIndices,
@@ -582,12 +560,9 @@ def build_dataloaders(
     augment_paper_gaussian: bool = False,
     augment_shift: bool = True,
     shift_steps: int = 10,
-    equalize_train_epoch_samples: bool = True,
-    train_epoch_num_samples: Optional[int] = None,
-) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
     x_train = bundle.x_all[split.train]
     y_train = bundle.y_all[split.train]
-    train_original_count = int(x_train.shape[0])
 
     x_train_use, y_train_use = apply_train_augmentation(
         x_train=x_train,
@@ -608,7 +583,6 @@ def build_dataloaders(
     train_ds = _build_tensor_dataset(_ensure_float32(x_train_use), _ensure_float32(y_train_use))
     val_ds = _build_tensor_dataset(_ensure_float32(x_val), _ensure_float32(y_val))
     test_ds = _build_tensor_dataset(_ensure_float32(x_test), _ensure_float32(y_test))
-    train_augmented_count = int(len(train_ds))
 
     generator = torch.Generator()
     generator.manual_seed(int(seed))
@@ -617,46 +591,13 @@ def build_dataloaders(
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
 
-    if train_epoch_num_samples is None or int(train_epoch_num_samples) <= 0:
-        epoch_num_samples = train_original_count
-    else:
-        epoch_num_samples = int(train_epoch_num_samples)
-
-    if epoch_num_samples <= 0:
-        raise ValueError("train_epoch_num_samples must be > 0")
-
-    if bool(equalize_train_epoch_samples):
-        sampler_num_samples = min(epoch_num_samples, train_augmented_count)
-        if sampler_num_samples == train_augmented_count:
-            train_loader = DataLoader(
-                train_ds,
-                batch_size=int(train_batch_size),
-                shuffle=True,
-                generator=generator,
-                **loader_kwargs,
-            )
-        else:
-            sampler = EpochSubsetRandomSampler(
-                num_items=train_augmented_count,
-                num_samples=sampler_num_samples,
-                seed=int(seed),
-            )
-            train_loader = DataLoader(
-                train_ds,
-                batch_size=int(train_batch_size),
-                sampler=sampler,
-                **loader_kwargs,
-            )
-        epoch_num_samples = sampler_num_samples
-    else:
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=int(train_batch_size),
-            shuffle=True,
-            generator=generator,
-            **loader_kwargs,
-        )
-        epoch_num_samples = train_augmented_count
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(train_batch_size),
+        shuffle=True,
+        generator=generator,
+        **loader_kwargs,
+    )
 
     val_loader = DataLoader(
         val_ds,
@@ -671,12 +612,4 @@ def build_dataloaders(
         **loader_kwargs,
     )
 
-    train_loader_info = {
-        "original_num_samples": train_original_count,
-        "augmented_num_samples": train_augmented_count,
-        "epoch_num_samples": int(epoch_num_samples),
-        "steps_per_epoch": int(len(train_loader)),
-        "equalized_epoch_samples": bool(equalize_train_epoch_samples),
-    }
-
-    return train_loader, val_loader, test_loader, train_loader_info
+    return train_loader, val_loader, test_loader

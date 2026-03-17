@@ -156,18 +156,6 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--augment-shift", type=str, default=str(defaults.get("augment_shift", "true")))
     parser.add_argument("--shift-steps", type=int, default=int(defaults.get("shift_steps", 10)))
     parser.add_argument(
-        "--equalize-train-epoch-samples",
-        type=str,
-        default=str(defaults.get("equalize_train_epoch_samples", "true")),
-        help="Keep the number of train samples seen per epoch fixed to the original split size.",
-    )
-    parser.add_argument(
-        "--train-epoch-num-samples",
-        type=int,
-        default=int(defaults.get("train_epoch_num_samples", 0)),
-        help="Optional override for train samples drawn per epoch when equalization is enabled (<=0 uses original split size).",
-    )
-    parser.add_argument(
         "--run-planA",
         "--run-plana",
         dest="run_planA",
@@ -576,7 +564,7 @@ def train_one_seed(
     if leakage["warnings"]:
         print(f"[seed={seed}] leakage warnings: {leakage['warnings']}")
 
-    train_loader, val_loader, test_loader, train_loader_info = build_dataloaders(
+    train_loader, val_loader, test_loader = build_dataloaders(
         bundle=bundle,
         split=split,
         train_batch_size=args["batchsize"],
@@ -588,8 +576,6 @@ def train_one_seed(
         augment_paper_gaussian=args["augment_paper_gaussian"],
         augment_shift=args["augment_shift"],
         shift_steps=args["shift_steps"],
-        equalize_train_epoch_samples=args["equalize_train_epoch_samples"],
-        train_epoch_num_samples=args["train_epoch_num_samples"],
     )
 
     if len(train_loader.dataset) == 0 or len(test_loader.dataset) == 0:
@@ -813,11 +799,6 @@ def train_one_seed(
         "augment_shift": bool(args["augment_shift"]),
         "shift_steps": int(args["shift_steps"]),
         "use_mixup": bool(args["use_mixup"]),
-        "equalize_train_epoch_samples": bool(args["equalize_train_epoch_samples"]),
-        "train_num_samples_original": int(train_loader_info["original_num_samples"]),
-        "train_num_samples_augmented": int(train_loader_info["augmented_num_samples"]),
-        "train_epoch_num_samples": int(train_loader_info["epoch_num_samples"]),
-        "train_steps_per_epoch": int(train_loader_info["steps_per_epoch"]),
         "train_time_sec": float(train_seconds),
         "eval_time_sec": float(eval_seconds),
         "checkpoint_path": relative_to_results_root(checkpoint_path, results_root),
@@ -1047,7 +1028,6 @@ def normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     cfg["augment_gaussian"] = str2bool(cfg["augment_gaussian"])
     cfg["augment_paper_gaussian"] = str2bool(cfg["augment_paper_gaussian"])
     cfg["augment_shift"] = str2bool(cfg["augment_shift"])
-    cfg["equalize_train_epoch_samples"] = str2bool(cfg["equalize_train_epoch_samples"])
     cfg["freq_use_abs"] = str2bool(cfg["freq_use_abs"])
     cfg["stratified_random_split"] = str2bool(cfg["stratified_random_split"])
     cfg["reuse_splits"] = str2bool(cfg["reuse_splits"])
@@ -1116,12 +1096,9 @@ def normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     cfg["run_name"] = str(cfg["run_name"]).strip()
     cfg["planA_output_dir"] = str(cfg["planA_output_dir"]).strip()
     cfg["shift_steps"] = int(cfg["shift_steps"])
-    cfg["train_epoch_num_samples"] = int(cfg["train_epoch_num_samples"])
 
     if cfg["shift_steps"] < 0:
         raise ValueError("shift_steps must be >= 0")
-    if cfg["train_epoch_num_samples"] < 0:
-        raise ValueError("train_epoch_num_samples must be >= 0")
     if cfg["augment_paper_gaussian"] and not cfg["augment_gaussian"]:
         raise ValueError("augment_paper_gaussian=true requires augment_gaussian=true")
     if cfg["augment_shift"] and not cfg["augment_train"]:

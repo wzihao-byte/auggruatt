@@ -109,7 +109,7 @@ def main() -> None:
             reuse_existing=_as_bool(cfg["reuse_splits"], True),
         )
 
-        _, _, test_loader, _ = build_dataloaders(
+        _, _, test_loader = build_dataloaders(
             bundle=bundle,
             split=split,
             train_batch_size=int(cfg["batchsize"]),
