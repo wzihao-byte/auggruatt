@@ -1,5 +1,7 @@
-﻿import argparse
+import argparse
+import hashlib
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -28,6 +30,15 @@ from protocol_utils import (
     to_serializable,
     write_csv,
     write_json,
+)
+from results_layout import (
+    build_experiment_layout,
+    build_run_manifest,
+    initialize_layout,
+    relative_to_results_root,
+    write_manifest_and_registry,
+    write_results_readme,
+    write_run_readme,
 )
 from tools.mixup import mixup
 
@@ -102,15 +113,89 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--freq-eps", type=float, default=float(defaults.get("freq_eps", 1e-8)))
 
-    parser.add_argument("--output-dir", type=str, default=str(defaults.get("output_dir", "results/protocol")))
-    parser.add_argument("--run-name", type=str, default=str(defaults.get("run_name", "")))
+    parser.add_argument("--results-root", type=str, default=str(defaults.get("results_root", "results")))
+    parser.add_argument(
+        "--experiment-family",
+        type=str,
+        choices=["protocol", "paper_repro", "exploratory"],
+        default=str(defaults.get("experiment_family", "protocol")),
+    )
+    parser.add_argument("--experiment-tag", type=str, default=str(defaults.get("experiment_tag", "")))
+    parser.add_argument(
+        "--experiment-group",
+        type=str,
+        default=str(defaults.get("experiment_group", "")),
+        help="Sweep family / grouping label. Used primarily for exploratory runs.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(defaults.get("output_dir", "")),
+        help="Legacy path override. Prefer --results-root with experiment metadata flags.",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=str(defaults.get("run_name", "")),
+        help="Legacy alias used as an experiment tag when present.",
+    )
     parser.add_argument("--device", type=str, default=str(defaults.get("device", "auto")))
     parser.add_argument("--num-workers", type=int, default=int(defaults.get("num_workers", 0)))
     parser.add_argument("--log-every", type=int, default=int(defaults.get("log_every", 10)))
 
     parser.add_argument("--seed-list", type=str, default=str(defaults.get("seed_list", "42,52,62")))
     parser.add_argument("--mixup-probs", type=str, default=str(defaults.get("mixup_probs", "0.3,0.7")))
+    parser.add_argument("--use-mixup", type=str, default=str(defaults.get("use_mixup", "true")))
     parser.add_argument("--augment-train", type=str, default=str(defaults.get("augment_train", "true")))
+    parser.add_argument("--augment-gaussian", type=str, default=str(defaults.get("augment_gaussian", "true")))
+    parser.add_argument(
+        "--augment-paper-gaussian",
+        type=str,
+        default=str(defaults.get("augment_paper_gaussian", "false")),
+    )
+    parser.add_argument("--augment-shift", type=str, default=str(defaults.get("augment_shift", "true")))
+    parser.add_argument("--shift-steps", type=int, default=int(defaults.get("shift_steps", 10)))
+    parser.add_argument(
+        "--equalize-train-epoch-samples",
+        type=str,
+        default=str(defaults.get("equalize_train_epoch_samples", "true")),
+        help="Keep the number of train samples seen per epoch fixed to the original split size.",
+    )
+    parser.add_argument(
+        "--train-epoch-num-samples",
+        type=int,
+        default=int(defaults.get("train_epoch_num_samples", 0)),
+        help="Optional override for train samples drawn per epoch when equalization is enabled (<=0 uses original split size).",
+    )
+    parser.add_argument(
+        "--run-planA",
+        "--run-plana",
+        dest="run_planA",
+        type=str,
+        default=str(defaults.get("run_planA", "false")),
+    )
+    parser.add_argument(
+        "--planA-output-dir",
+        "--plana-output-dir",
+        dest="planA_output_dir",
+        type=str,
+        default=str(defaults.get("planA_output_dir", "")),
+        help="Optional fixed output directory for Plan A. When empty, a timestamped directory is created.",
+    )
+    parser.add_argument(
+        "--overwrite-output-dir",
+        type=str,
+        default=str(defaults.get("overwrite_output_dir", "false")),
+        help="Allow Plan A to delete an existing output directory before rerunning.",
+    )
+    parser.add_argument(
+        "--planA-include-baseline-mixup",
+        "--plana-include-baseline-mixup",
+        dest="planA_include_baseline_mixup",
+        type=str,
+        default=str(defaults.get("planA_include_baseline_mixup", "false")),
+        help="Include baseline+mixup as an extra Plan A cell.",
+    )
 
     parser.add_argument("--split-mode", type=str, choices=["predefined", "random", "group"], default=str(defaults.get("split_mode", "predefined")))
     parser.add_argument("--group-key", type=str, choices=["auto", "subject", "session", "environment"], default=str(defaults.get("group_key", "auto")))
@@ -165,6 +250,43 @@ def resolve_ratios(train_ratio: float, val_ratio: float, test_ratio: float) -> T
         raise ValueError("split ratios sum must be > 0")
     ratios = ratios / ratios.sum()
     return float(ratios[0]), float(ratios[1]), float(ratios[2])
+
+
+def apply_mixup_train_only(
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    enable_mixup: bool,
+    alpha: float,
+    phase: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if enable_mixup and str(phase) != "train":
+        raise RuntimeError("mixup may only be applied during training")
+    if not enable_mixup:
+        return inputs, labels
+
+    mixed_inputs, label_a, label_b, lam = mixup(inputs, labels, alpha)
+    lam_float = float(lam.item()) if hasattr(lam, "item") else float(lam)
+    targets = lam_float * label_a + (1.0 - lam_float) * label_b
+    return mixed_inputs, targets
+
+
+def split_file_fingerprint(split_file: Path) -> str:
+    payload = json.loads(split_file.read_text(encoding="utf-8"))
+    core = {
+        "train": [int(v) for v in payload.get("train", [])],
+        "val": [int(v) for v in payload.get("val", [])],
+        "test": [int(v) for v in payload.get("test", [])],
+    }
+    normalized = json.dumps(core, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _mean_std(values: Sequence[float]) -> Tuple[float, float]:
+    arr = np.asarray([float(v) for v in values], dtype=np.float64)
+    if arr.size == 0:
+        return 0.0, 0.0
+    return float(arr.mean()), float(arr.std(ddof=0))
 
 
 def evaluate(
@@ -427,12 +549,14 @@ def train_one_seed(
     args: Dict[str, Any],
     bundle,
     run_dir: Path,
+    results_root: Path,
+    splits_dir: Path,
     device: torch.device,
 ) -> Dict[str, Any]:
-    seed_dir = ensure_dir(run_dir / f"seed_{seed}")
-    split_dir = ensure_dir(run_dir / "splits")
+    seed_dir = ensure_dir(run_dir / "seeds" / f"seed_{seed}")
+    figures_dir = ensure_dir(seed_dir / "figures")
 
-    split_file = split_dir / f"{bundle.dataset_name}_{args['split_mode']}_{args['group_key']}_seed{seed}.json"
+    split_file = splits_dir / f"split_seed{seed}.json"
     split, split_meta = generate_or_load_split(
         bundle=bundle,
         split_file=split_file,
@@ -452,7 +576,7 @@ def train_one_seed(
     if leakage["warnings"]:
         print(f"[seed={seed}] leakage warnings: {leakage['warnings']}")
 
-    train_loader, val_loader, test_loader = build_dataloaders(
+    train_loader, val_loader, test_loader, train_loader_info = build_dataloaders(
         bundle=bundle,
         split=split,
         train_batch_size=args["batchsize"],
@@ -460,13 +584,21 @@ def train_one_seed(
         num_workers=args["num_workers"],
         seed=seed,
         augment_train=args["augment_train"],
+        augment_gaussian=args["augment_gaussian"],
+        augment_paper_gaussian=args["augment_paper_gaussian"],
+        augment_shift=args["augment_shift"],
+        shift_steps=args["shift_steps"],
+        equalize_train_epoch_samples=args["equalize_train_epoch_samples"],
+        train_epoch_num_samples=args["train_epoch_num_samples"],
     )
 
     if len(train_loader.dataset) == 0 or len(test_loader.dataset) == 0:
         raise RuntimeError("empty train/test split")
+    if len(val_loader.dataset) == 0:
+        raise RuntimeError("validation split is empty; refusing to use test split for checkpoint selection")
 
-    eval_loader = val_loader if len(val_loader.dataset) > 0 else test_loader
-    eval_split_name = "val" if len(val_loader.dataset) > 0 else "test"
+    eval_loader = val_loader
+    eval_split_name = "val"
 
     model = build_model(
         model_variant=args["model_variant"],
@@ -488,11 +620,12 @@ def train_one_seed(
     if len(mixup_probs) != 2:
         raise ValueError("mixup_probs must contain 2 values")
     prob_sum = float(mixup_probs[0] + mixup_probs[1])
-    p_mixup = float(mixup_probs[0] / max(prob_sum, 1e-12))
+    p_mixup = float(mixup_probs[0] / max(prob_sum, 1e-12)) if args["use_mixup"] else 0.0
 
     history_rows: List[Dict[str, Any]] = []
     best_state = None
     best_eval_macro_f1 = -1.0
+    best_eval_accuracy = 0.0
 
     train_start = time.perf_counter()
     for epoch in range(args["epochs"]):
@@ -507,12 +640,14 @@ def train_one_seed(
 
             optimizer.zero_grad()
 
-            use_mixup = np.random.rand() < p_mixup
-            if use_mixup:
-                inputs, label_a, label_b, lam = mixup(inputs, labels, 1.0)
-                targets = float(lam.item()) * label_a + (1.0 - float(lam.item())) * label_b
-            else:
-                targets = labels
+            use_mixup_batch = bool(args["use_mixup"]) and (np.random.rand() < p_mixup)
+            inputs, targets = apply_mixup_train_only(
+                inputs,
+                labels,
+                enable_mixup=use_mixup_batch,
+                alpha=1.0,
+                phase="train",
+            )
 
             logits = model(inputs)
             if isinstance(logits, tuple):
@@ -556,6 +691,7 @@ def train_one_seed(
 
         if float(eval_metrics["macro_f1"]) > best_eval_macro_f1:
             best_eval_macro_f1 = float(eval_metrics["macro_f1"])
+            best_eval_accuracy = float(eval_metrics["accuracy"])
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         if args["log_every"] > 0 and (
@@ -583,7 +719,7 @@ def train_one_seed(
         seed=seed,
     )
     eval_seconds = time.perf_counter() - eval_start
-    checkpoint_path = seed_dir / f"best_model_{args['model_variant']}.pt"
+    checkpoint_path = seed_dir / "checkpoint_best.pt"
     torch.save(
         {
             "model_variant": args["model_variant"],
@@ -640,14 +776,14 @@ def train_one_seed(
         maybe_save_confusion_png(
             confusion=confusion,
             class_names=bundle.class_names,
-            path=seed_dir / "confusion_matrix.png",
+            path=figures_dir / "confusion_matrix.png",
             normalize=False,
             title=f"Confusion (seed={seed})",
         )
         maybe_save_confusion_png(
             confusion=confusion,
             class_names=bundle.class_names,
-            path=seed_dir / "confusion_matrix_row_normalized.png",
+            path=figures_dir / "confusion_matrix_row_normalized.png",
             normalize=True,
             title=f"Confusion Row-Normalized (seed={seed})",
         )
@@ -665,13 +801,26 @@ def train_one_seed(
         "group_key_requested": split.group_key_requested,
         "group_key_used": split.group_key_used,
         "eval_split_used_for_checkpoint": eval_split_name,
+        "val_accuracy_best": float(best_eval_accuracy),
+        "val_macro_f1_best": float(best_eval_macro_f1),
         "accuracy": float(clean_metrics["accuracy"]),
         "macro_f1": float(clean_metrics["macro_f1"]),
         "loss": float(clean_metrics["loss"]),
         "num_samples": int(clean_metrics["num_samples"]),
+        "augment_train": bool(args["augment_train"]),
+        "augment_gaussian": bool(args["augment_gaussian"]),
+        "augment_paper_gaussian": bool(args["augment_paper_gaussian"]),
+        "augment_shift": bool(args["augment_shift"]),
+        "shift_steps": int(args["shift_steps"]),
+        "use_mixup": bool(args["use_mixup"]),
+        "equalize_train_epoch_samples": bool(args["equalize_train_epoch_samples"]),
+        "train_num_samples_original": int(train_loader_info["original_num_samples"]),
+        "train_num_samples_augmented": int(train_loader_info["augmented_num_samples"]),
+        "train_epoch_num_samples": int(train_loader_info["epoch_num_samples"]),
+        "train_steps_per_epoch": int(train_loader_info["steps_per_epoch"]),
         "train_time_sec": float(train_seconds),
         "eval_time_sec": float(eval_seconds),
-        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_path": relative_to_results_root(checkpoint_path, results_root),
         **params_info,
         **latency,
     }
@@ -709,7 +858,6 @@ def train_one_seed(
     )
     write_json(seed_dir / "split_summary.json", split_meta)
     write_json(seed_dir / "leakage_report.json", leakage)
-    write_json(seed_dir / "run_config_snapshot.json", {**args, "seed": int(seed)})
 
     robustness_rows: List[Dict[str, Any]] = []
     if args["run_robustness"]:
@@ -753,12 +901,21 @@ def train_one_seed(
         "clean_confusion": confusion,
         "attention_diag": attention_diag,
         "robustness_rows": robustness_rows,
+        "split_file": str(split_meta.get("split_file", split_file)),
+        "split_counts": {
+            "train": int(len(split.train)),
+            "val": int(len(split.val)),
+            "test": int(len(split.test)),
+        },
+        "eval_split_name": eval_split_name,
     }
 
 
 def aggregate_outputs(run_dir: Path, bundle, seed_outputs: Sequence[Dict[str, Any]], save_confusion_png: bool) -> None:
+    aggregate_dir = ensure_dir(run_dir / "aggregate")
+    robustness_dir = ensure_dir(run_dir / "robustness")
     seed_rows = [entry["seed_metrics"] for entry in seed_outputs]
-    write_csv(run_dir / "seed_stats.csv", seed_rows, fieldnames=list(seed_rows[0].keys()))
+    write_csv(aggregate_dir / "seed_metrics.csv", seed_rows, fieldnames=list(seed_rows[0].keys()))
 
     summary = aggregate_mean_std(
         seed_rows,
@@ -767,7 +924,7 @@ def aggregate_outputs(run_dir: Path, bundle, seed_outputs: Sequence[Dict[str, An
     summary_rows = []
     for metric, stats in summary.items():
         summary_rows.append({"metric": metric, "mean": stats["mean"], "std": stats["std"]})
-    write_csv(run_dir / "baseline_protocol_results.csv", summary_rows, fieldnames=["metric", "mean", "std"])
+    write_csv(aggregate_dir / "summary_metrics.csv", summary_rows, fieldnames=["metric", "mean", "std"])
 
     per_class_values = []
     for entry in seed_outputs:
@@ -787,7 +944,7 @@ def aggregate_outputs(run_dir: Path, bundle, seed_outputs: Sequence[Dict[str, An
             }
         )
     write_csv(
-        run_dir / "per_class_f1_summary.csv",
+        aggregate_dir / "per_class_f1_summary.csv",
         per_class_rows,
         fieldnames=["class_index", "class_name", "f1_mean", "f1_std"],
     )
@@ -795,21 +952,21 @@ def aggregate_outputs(run_dir: Path, bundle, seed_outputs: Sequence[Dict[str, An
     confusion_stack = np.stack([entry["clean_confusion"] for entry in seed_outputs], axis=0)
     confusion_mean = confusion_stack.mean(axis=0)
     confusion_mean_norm = normalize_confusion_rows(confusion_mean)
-    np.save(run_dir / "confusion_matrix_mean.npy", confusion_mean)
-    np.save(run_dir / "confusion_matrix_mean_row_normalized.npy", confusion_mean_norm)
+    np.save(aggregate_dir / "confusion_matrix_mean.npy", confusion_mean)
+    np.save(aggregate_dir / "confusion_matrix_mean_row_normalized.npy", confusion_mean_norm)
 
     if save_confusion_png:
         maybe_save_confusion_png(
             confusion=confusion_mean,
             class_names=bundle.class_names,
-            path=run_dir / "confusion_matrix_mean.png",
+            path=aggregate_dir / "confusion_matrix_mean.png",
             normalize=False,
             title="Mean Confusion Across Seeds",
         )
         maybe_save_confusion_png(
             confusion=confusion_mean,
             class_names=bundle.class_names,
-            path=run_dir / "confusion_matrix_mean_row_normalized.png",
+            path=aggregate_dir / "confusion_matrix_mean_row_normalized.png",
             normalize=True,
             title="Mean Row-Normalized Confusion Across Seeds",
         )
@@ -837,7 +994,7 @@ def aggregate_outputs(run_dir: Path, bundle, seed_outputs: Sequence[Dict[str, An
 
     if attention_rows:
         write_csv(
-            run_dir / "attention_diagnostics_summary.csv",
+            aggregate_dir / "attention_diagnostics_summary.csv",
             attention_rows,
             fieldnames=list(attention_rows[0].keys()),
         )
@@ -848,7 +1005,7 @@ def aggregate_outputs(run_dir: Path, bundle, seed_outputs: Sequence[Dict[str, An
 
     if all_robustness_rows:
         write_csv(
-            run_dir / "robustness_results.csv",
+            robustness_dir / "robustness_results.csv",
             all_robustness_rows,
             fieldnames=["seed", "corruption", "severity", "accuracy", "macro_f1", "loss", "num_samples"],
         )
@@ -873,7 +1030,7 @@ def aggregate_outputs(run_dir: Path, bundle, seed_outputs: Sequence[Dict[str, An
                 }
             )
         write_csv(
-            run_dir / "robustness_summary.csv",
+            robustness_dir / "robustness_summary.csv",
             summary_rows,
             fieldnames=["corruption", "severity", "accuracy_mean", "accuracy_std", "macro_f1_mean", "macro_f1_std"],
         )
@@ -882,7 +1039,15 @@ def aggregate_outputs(run_dir: Path, bundle, seed_outputs: Sequence[Dict[str, An
 def normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(raw)
 
+    cfg["run_planA"] = str2bool(cfg["run_planA"])
+    cfg["overwrite_output_dir"] = str2bool(cfg["overwrite_output_dir"])
+    cfg["planA_include_baseline_mixup"] = str2bool(cfg["planA_include_baseline_mixup"])
+    cfg["use_mixup"] = str2bool(cfg["use_mixup"])
     cfg["augment_train"] = str2bool(cfg["augment_train"])
+    cfg["augment_gaussian"] = str2bool(cfg["augment_gaussian"])
+    cfg["augment_paper_gaussian"] = str2bool(cfg["augment_paper_gaussian"])
+    cfg["augment_shift"] = str2bool(cfg["augment_shift"])
+    cfg["equalize_train_epoch_samples"] = str2bool(cfg["equalize_train_epoch_samples"])
     cfg["freq_use_abs"] = str2bool(cfg["freq_use_abs"])
     cfg["stratified_random_split"] = str2bool(cfg["stratified_random_split"])
     cfg["reuse_splits"] = str2bool(cfg["reuse_splits"])
@@ -943,7 +1108,295 @@ def normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     if cfg["attention_max_export_samples"] < 0:
         raise ValueError("attention_max_export_samples must be >= 0")
 
+    cfg["results_root"] = str(cfg["results_root"]).strip() or "results"
+    cfg["experiment_family"] = str(cfg["experiment_family"]).strip().lower() or "protocol"
+    cfg["experiment_tag"] = str(cfg["experiment_tag"]).strip()
+    cfg["experiment_group"] = str(cfg["experiment_group"]).strip()
+    cfg["output_dir"] = str(cfg["output_dir"]).strip()
+    cfg["run_name"] = str(cfg["run_name"]).strip()
+    cfg["planA_output_dir"] = str(cfg["planA_output_dir"]).strip()
+    cfg["shift_steps"] = int(cfg["shift_steps"])
+    cfg["train_epoch_num_samples"] = int(cfg["train_epoch_num_samples"])
+
+    if cfg["shift_steps"] < 0:
+        raise ValueError("shift_steps must be >= 0")
+    if cfg["train_epoch_num_samples"] < 0:
+        raise ValueError("train_epoch_num_samples must be >= 0")
+    if cfg["augment_paper_gaussian"] and not cfg["augment_gaussian"]:
+        raise ValueError("augment_paper_gaussian=true requires augment_gaussian=true")
+    if cfg["augment_shift"] and not cfg["augment_train"]:
+        raise ValueError("shift augmentation requested while augment_train=false")
+    if not cfg["augment_train"]:
+        cfg["augment_gaussian"] = False
+        cfg["augment_paper_gaussian"] = False
+        cfg["augment_shift"] = False
+
     return cfg
+
+
+def run_planA_ablation(
+    args: Dict[str, Any],
+    bundle,
+    device: torch.device,
+    repo_root: Path,
+    results_root: Path,
+) -> Path:
+    if str(args["dataset"]).strip().lower() != "aril":
+        raise ValueError("run_planA currently supports dataset=aril only")
+    if str(args["split_mode"]).strip().lower() != "predefined":
+        raise ValueError("run_planA requires split_mode=predefined")
+
+    required_seeds = [42, 52, 62]
+    if [int(v) for v in args["seed_list"]] != required_seeds:
+        raise ValueError("run_planA requires --seed-list 42,52,62")
+
+    requested_output_dir = str(args.get("planA_output_dir", "")).strip()
+    if requested_output_dir:
+        ablation_root = Path(requested_output_dir).expanduser()
+        if not ablation_root.is_absolute():
+            ablation_root = (repo_root / ablation_root).resolve()
+        else:
+            ablation_root = ablation_root.resolve()
+        if ablation_root.exists():
+            if not bool(args.get("overwrite_output_dir", False)):
+                raise FileExistsError(
+                    f"Plan A output directory already exists: {ablation_root}. "
+                    "Pass --overwrite-output-dir true to replace it."
+                )
+            shutil.rmtree(ablation_root)
+        ablation_root = ensure_dir(ablation_root)
+    else:
+        ablation_root = ensure_dir(results_root / "ablations" / f"aril_planA_{timestamp_now()}")
+    cells_root = ensure_dir(ablation_root / "cells")
+    shared_splits_dir = ensure_dir(ablation_root / "shared_splits")
+
+    dataset_summary = {
+        "dataset": bundle.dataset_name,
+        "num_samples": int(bundle.x_all.shape[0]),
+        "num_classes": int(bundle.num_classes),
+        "input_size": int(bundle.input_size),
+        "class_names": bundle.class_names,
+    }
+    write_json(
+        ablation_root / "ablation_metadata.json",
+        {
+            "ablation_name": "planA",
+            "dataset": "aril",
+            "timestamp": timestamp_now(),
+            "base_args": to_serializable(args),
+            "dataset_summary": dataset_summary,
+            "environment": collect_environment_info(repo_root),
+        },
+    )
+
+    cells = [
+        {
+            "cell_name": "aril_planA_baseline",
+            "overrides": {
+                "augment_train": False,
+                "augment_gaussian": False,
+                "augment_paper_gaussian": False,
+                "augment_shift": False,
+                "use_mixup": False,
+            },
+        },
+        {
+            "cell_name": "aril_planA_gaussian",
+            "overrides": {
+                "augment_train": True,
+                "augment_gaussian": True,
+                "augment_paper_gaussian": True,
+                "augment_shift": False,
+                "use_mixup": False,
+            },
+        },
+        {
+            "cell_name": "aril_planA_gaussian_shift",
+            "overrides": {
+                "augment_train": True,
+                "augment_gaussian": True,
+                "augment_paper_gaussian": True,
+                "augment_shift": True,
+                "use_mixup": False,
+            },
+        },
+        {
+            "cell_name": "aril_planA_gaussian_shift_mixup",
+            "overrides": {
+                "augment_train": True,
+                "augment_gaussian": True,
+                "augment_paper_gaussian": True,
+                "augment_shift": True,
+                "use_mixup": True,
+            },
+        },
+    ]
+
+    if bool(args.get("planA_include_baseline_mixup", False)):
+        cells.append(
+            {
+                "cell_name": "aril_planA_baseline_mixup_cuda",
+                "overrides": {
+                    "augment_train": False,
+                    "augment_gaussian": False,
+                    "augment_paper_gaussian": False,
+                    "augment_shift": False,
+                    "use_mixup": True,
+                },
+            }
+        )
+
+    mixup_cells = [cell["cell_name"] for cell in cells if bool(cell["overrides"]["use_mixup"])]
+    expected_mixup_cells = ["aril_planA_gaussian_shift_mixup"]
+    if bool(args.get("planA_include_baseline_mixup", False)):
+        expected_mixup_cells.append("aril_planA_baseline_mixup_cuda")
+    if sorted(mixup_cells) != sorted(expected_mixup_cells):
+        raise RuntimeError("Plan A guardrail violated: unexpected mixup cell configuration")
+
+    summary_rows: List[Dict[str, Any]] = []
+    reference_split_fingerprints: Optional[Dict[int, str]] = None
+
+    for cell in cells:
+        cell_name = str(cell["cell_name"])
+        cell_dir = ensure_dir(cells_root / cell_name)
+        cell_config_dir = ensure_dir(cell_dir / "config")
+
+        cell_args = dict(args)
+        cell_args.update(cell["overrides"])
+        cell_args["split_mode"] = "predefined"
+        cell_args["reuse_splits"] = True
+        cell_args["run_robustness"] = False
+        cell_args["shift_steps"] = int(args["shift_steps"])
+
+        if cell_args["augment_paper_gaussian"] and not cell_args["augment_gaussian"]:
+            raise RuntimeError(f"[{cell_name}] paper_gaussian=true but augment_gaussian=false")
+        if cell_args["augment_shift"] and not cell_args["augment_train"]:
+            raise RuntimeError(f"[{cell_name}] shift requested while augment_train=false")
+        if not cell_args["augment_train"]:
+            cell_args["augment_gaussian"] = False
+            cell_args["augment_paper_gaussian"] = False
+            cell_args["augment_shift"] = False
+
+        write_json(cell_config_dir / "resolved_config.json", to_serializable(cell_args))
+
+        seed_outputs = []
+        for seed in cell_args["seed_list"]:
+            print(f"[PlanA] {cell_name} seed={seed}")
+            set_global_seed(int(seed), deterministic=True)
+            out = train_one_seed(
+                seed=int(seed),
+                args=cell_args,
+                bundle=bundle,
+                run_dir=cell_dir,
+                results_root=results_root,
+                splits_dir=shared_splits_dir,
+                device=device,
+            )
+            if str(out.get("eval_split_name", "")) != "val":
+                raise RuntimeError("test set used for checkpoint selection; val split is required")
+            seed_outputs.append(out)
+
+        aggregate_outputs(
+            run_dir=cell_dir,
+            bundle=bundle,
+            seed_outputs=seed_outputs,
+            save_confusion_png=bool(cell_args["save_confusion_png"]),
+        )
+
+        split_paths = []
+        split_fingerprints: Dict[int, str] = {}
+        for seed in cell_args["seed_list"]:
+            split_file = shared_splits_dir / f"split_seed{int(seed)}.json"
+            if not split_file.exists():
+                raise FileNotFoundError(f"missing split artifact: {split_file}")
+            split_fingerprints[int(seed)] = split_file_fingerprint(split_file)
+            split_paths.append(relative_to_results_root(split_file, results_root))
+
+        if reference_split_fingerprints is None:
+            reference_split_fingerprints = dict(split_fingerprints)
+        elif split_fingerprints != reference_split_fingerprints:
+            raise RuntimeError("different cells used different split artifacts")
+
+        split_counts = [entry["split_counts"] for entry in seed_outputs]
+        first_counts = split_counts[0]
+        for counts in split_counts[1:]:
+            if counts != first_counts:
+                raise RuntimeError(f"inconsistent split sizes across seeds in cell {cell_name}")
+
+        seed_rows = [entry["seed_metrics"] for entry in seed_outputs]
+        test_accuracy_mean, test_accuracy_std = _mean_std([row["accuracy"] for row in seed_rows])
+        test_macro_f1_mean, test_macro_f1_std = _mean_std([row["macro_f1"] for row in seed_rows])
+        val_accuracy_mean, _ = _mean_std([row["val_accuracy_best"] for row in seed_rows])
+        val_macro_f1_mean, _ = _mean_std([row["val_macro_f1_best"] for row in seed_rows])
+
+        mixup_config = {
+            "enabled": bool(cell_args["use_mixup"]),
+            "mixup_probs": [float(v) for v in cell_args["mixup_probs"]],
+            "alpha": 1.0,
+        }
+
+        summary_rows.append(
+            {
+                "cell_name": cell_name,
+                "dataset": str(cell_args["dataset"]),
+                "seed_list": [int(v) for v in cell_args["seed_list"]],
+                "split_mode": str(cell_args["split_mode"]),
+                "split_file": ";".join(split_paths),
+                "augment_train": bool(cell_args["augment_train"]),
+                "augment_gaussian": bool(cell_args["augment_gaussian"]),
+                "augment_paper_gaussian": bool(cell_args["augment_paper_gaussian"]),
+                "augment_shift": bool(cell_args["augment_shift"]),
+                "shift_steps": int(cell_args["shift_steps"]),
+                "use_mixup": bool(cell_args["use_mixup"]),
+                "mixup_configuration": mixup_config,
+                "num_train": int(first_counts["train"]),
+                "num_val": int(first_counts["val"]),
+                "num_test": int(first_counts["test"]),
+                "test_accuracy_mean": test_accuracy_mean,
+                "test_accuracy_std": test_accuracy_std,
+                "test_macro_f1_mean": test_macro_f1_mean,
+                "test_macro_f1_std": test_macro_f1_std,
+                "val_accuracy_mean": val_accuracy_mean,
+                "val_macro_f1_mean": val_macro_f1_mean,
+            }
+        )
+
+    fieldnames = [
+        "cell_name",
+        "dataset",
+        "seed_list",
+        "split_mode",
+        "split_file",
+        "augment_train",
+        "augment_gaussian",
+        "augment_paper_gaussian",
+        "augment_shift",
+        "shift_steps",
+        "use_mixup",
+        "mixup_configuration",
+        "num_train",
+        "num_val",
+        "num_test",
+        "test_accuracy_mean",
+        "test_accuracy_std",
+        "test_macro_f1_mean",
+        "test_macro_f1_std",
+        "val_accuracy_mean",
+        "val_macro_f1_mean",
+    ]
+    write_csv(ablation_root / "planA_ablation_summary.csv", summary_rows, fieldnames=fieldnames)
+    write_json(
+        ablation_root / "planA_ablation_summary.json",
+        {
+            "ablation_name": "planA",
+            "dataset": "aril",
+            "cells": summary_rows,
+            "shared_split_dir": relative_to_results_root(shared_splits_dir, results_root),
+            "split_fingerprints_by_seed": reference_split_fingerprints or {},
+        },
+    )
+
+    return ablation_root
 
 
 def main() -> None:
@@ -959,35 +1412,91 @@ def main() -> None:
     device = resolve_device(args["device"])
 
     repo_root = Path(__file__).resolve().parent
-    run_tag = args["run_name"].strip() if str(args["run_name"]).strip() else f"{args['dataset']}_protocol_{timestamp_now()}"
-    run_dir = ensure_dir(Path(args["output_dir"]).resolve() / run_tag)
+    results_root = Path(args["results_root"]).resolve()
+    write_results_readme(results_root)
+
+    if args["run_planA"]:
+        print(f"Using device: {device}")
+        bundle = load_dataset_bundle(args["dataset"], metadata_path=args["metadata_path"])
+        ablation_root = run_planA_ablation(
+            args=args,
+            bundle=bundle,
+            device=device,
+            repo_root=repo_root,
+            results_root=results_root,
+        )
+        print(f"Plan A ablation completed: {ablation_root}")
+        return
+
+    experiment_tag = args["experiment_tag"] or args["run_name"] or f"{args['model_variant']}-{args['temporal_pooling']}"
+    experiment_group = args["experiment_group"]
+    if not experiment_group and args["experiment_family"] == "exploratory":
+        experiment_group = f"{args['dataset']}-{args['model_variant']}-sweep"
+    if not experiment_group and args["output_dir"]:
+        experiment_group = Path(args["output_dir"]).name
+
+    layout = initialize_layout(
+        build_experiment_layout(
+            results_root=results_root,
+            family=args["experiment_family"],
+            dataset=args["dataset"],
+            model_variant=args["model_variant"],
+            split_mode=args["split_mode"],
+            experiment_tag=experiment_tag,
+            experiment_group=experiment_group,
+        )
+    )
+    run_dir = layout.run_dir
 
     print(f"Using device: {device}")
     print(f"Run dir: {run_dir}")
 
-    write_json(run_dir / "run_metadata.json", collect_environment_info(repo_root))
-    write_json(run_dir / "run_config_snapshot.json", to_serializable(args))
-
     bundle = load_dataset_bundle(args["dataset"], metadata_path=args["metadata_path"])
-    write_json(
-        run_dir / "dataset_summary.json",
-        {
-            "dataset": bundle.dataset_name,
-            "num_samples": int(bundle.x_all.shape[0]),
-            "num_classes": int(bundle.num_classes),
-            "input_size": int(bundle.input_size),
-            "class_names": bundle.class_names,
-        },
+    dataset_summary = {
+        "dataset": bundle.dataset_name,
+        "num_samples": int(bundle.x_all.shape[0]),
+        "num_classes": int(bundle.num_classes),
+        "input_size": int(bundle.input_size),
+        "class_names": bundle.class_names,
+    }
+    env_info = collect_environment_info(repo_root)
+    write_json(layout.config_dir / "cli_args.json", to_serializable(vars(args_ns)))
+    write_json(layout.config_dir / "resolved_config.json", to_serializable(args))
+    write_json(layout.config_dir / "dataset_summary.json", dataset_summary)
+    write_json(layout.config_dir / "env.json", env_info)
+
+    manifest = build_run_manifest(
+        layout=layout,
+        cli_args=vars(args_ns),
+        resolved_config=args,
+        dataset_summary=dataset_summary,
+        env=env_info,
+        seed_list=args["seed_list"],
+        group_key=args["group_key"],
+        status="running",
     )
+    write_manifest_and_registry(layout, manifest)
+    write_run_readme(layout, manifest)
 
     seed_outputs = []
     for seed in args["seed_list"]:
         print(f"=== Seed {seed} ===")
         set_global_seed(int(seed), deterministic=True)
-        out = train_one_seed(seed=int(seed), args=args, bundle=bundle, run_dir=run_dir, device=device)
+        out = train_one_seed(
+            seed=int(seed),
+            args=args,
+            bundle=bundle,
+            run_dir=run_dir,
+            results_root=results_root,
+            splits_dir=layout.splits_dir,
+            device=device,
+        )
         seed_outputs.append(out)
 
     aggregate_outputs(run_dir=run_dir, bundle=bundle, seed_outputs=seed_outputs, save_confusion_png=args["save_confusion_png"])
+    manifest["status"] = "completed"
+    write_manifest_and_registry(layout, manifest)
+    write_run_readme(layout, manifest)
     print(f"Protocol run completed: {run_dir}")
 
 
